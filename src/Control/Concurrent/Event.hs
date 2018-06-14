@@ -61,9 +61,9 @@ module Control.Concurrent.Event (
   , foldrE
   ) where
 
-import Control.Monad ( ap, when )
+import Control.Monad ( ap )
 import Control.Monad.IO.Class ( MonadIO(..) )
-import Data.Foldable ( traverse_ )
+import Data.Foldable ( foldMap )
 import Data.IntMap as M
 import Data.IORef
 import Data.Semigroup ( Semigroup(..) )
@@ -75,34 +75,35 @@ import Data.Semigroup ( Semigroup(..) )
 --
 -- 'Event's can be triggered with the 'trigger' function and the associated
 -- type 'Trigger'.
-newtype Event a = Event { unEvent :: (a -> IO ()) -> IO Detach }
+newtype Event r a = Event { unEvent :: (a -> IO r) -> IO Detach }
 
-instance Applicative Event where
+instance Monoid r => Applicative (Event r) where
   pure x = Event $ \k -> k x >> pure mempty
   (<*>) = ap
 
-instance Functor Event where
+instance Functor (Event r) where
   fmap f e = Event $ \k -> on e $ k . f
 
-instance Monad Event where
+instance Monoid r => Monad (Event r) where
   return = pure
   x >>= f = Event $ \k -> do
     dref <- newIORef mempty
     dx <- on x $ \x' -> do
       dfx <- on (f x') k
       modifyIORef dref (<> dfx)
+      return mempty
     modifyIORef dref (<> dx)
     pure . Detach $ readIORef dref >>= detach
 
-instance Monoid (Event a) where
+instance Monoid (Event r a) where
   mempty = Event . const $ pure mempty
   mappend = (<>)
 
-instance Semigroup (Event a) where
+instance Semigroup (Event r a) where
   a <> b = Event $ \k -> (<>) <$> on a k <*> on b k
 
 -- |Register an action.
-on :: (MonadIO m) => Event a -> (a -> IO ()) -> m Detach
+on :: MonadIO m => Event r a -> (a -> IO r) -> m Detach
 on (Event register) f = liftIO $ register f
 
 -- |'Detach' is used to detach an action from an 'Event'.
@@ -116,21 +117,21 @@ instance Semigroup Detach where
   a <> b = Detach $ detach a >> detach b
 
 -- |@'Trigger' a@ is used to 'trigger' an @'Event' a@.
-newtype Trigger a = Trigger (a -> IO ())
+newtype Trigger r a = Trigger (a -> IO r)
 
-instance Monoid (Trigger a) where
-  mempty = Trigger . const $ pure ()
+instance Monoid r => Monoid (Trigger r a) where
+  mempty = Trigger . const $ pure mempty
   mappend = (<>)
   
-instance Semigroup (Trigger a) where
+instance Semigroup (Trigger r a) where
   Trigger f <> Trigger g = Trigger $ \a -> f a >> g a
 
 -- |Use a 'Trigger'.
-trigger :: (MonadIO m) => Trigger a -> a -> m ()
+trigger :: (MonadIO m) => Trigger r a -> a -> m r
 trigger (Trigger f) = liftIO . f
 
 -- |Create a new @'Event' a@ along with a @'Trigger' a@.
-newEvent :: (MonadIO m) => m (Event a,Trigger a)
+newEvent :: (Monoid r, MonadIO m) => m (Event r a,Trigger r a)
 newEvent = liftIO $ do
     callbacksRef <- newIORef M.empty
     hRef <- newIORef 0
@@ -141,18 +142,18 @@ newEvent = liftIO $ do
       modifyIORef callbacksRef $ insert h cb
       writeIORef hRef (succ h)
       pure . Detach . modifyIORef callbacksRef $ delete h
-    register ref = Trigger $ \a -> liftIO $ readIORef ref >>= traverse_ ($ a)
+    register ref = Trigger $ \a -> liftIO $ readIORef ref >>= foldMap ($ a)
 
 -- |Filter an 'Event' with a predicate.
-filterE :: (a -> Bool) -> Event a -> Event a
+filterE :: Monoid r => (a -> Bool) -> Event r a -> Event r a
 filterE predicate e = Event $ \k -> do
   (filtered,trig) <- newEvent
-  _ <- on e $ \a -> when (predicate a) (trigger trig a)
+  _ <- on e $ \a -> if predicate a then trigger trig a else return mempty
   unEvent filtered k
 
 -- |Right fold an 'Event'. Each time an event occur, the function folding function is applied and
 -- the result is passed to the future 'Event'.
-foldrE :: (b -> a -> b) -> b -> Event a -> Event b
+foldrE :: Monoid r => (b -> a -> b) -> b -> Event r a -> Event r b
 foldrE f b e = Event $ \k -> do
   (folded,trig) <- newEvent
   ref <- newIORef b
